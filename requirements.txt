@@ -1,0 +1,2 @@
+PyPDF2>=3.0.0        # For reading PDF metadata
+requests>=2.31.0     # For API communication

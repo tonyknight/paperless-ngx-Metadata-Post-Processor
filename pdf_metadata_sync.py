@@ -14,243 +14,244 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class SimplePaperlessAPI:
-    def __init__(self, api_url, auth_token):
-        self.logger = logging.getLogger(__name__)
-        if api_url[-1] == "/":
-            api_url = api_url[:-1]
-        self._api_url = api_url
-        self._auth_token = auth_token
-        self.logger.info(f"Initialized API connection to {api_url}")
+# Add startup banner for clear visibility in logs
+logger.info("="*50)
+logger.info("PDF Metadata Sync Script Starting")
+logger.info("="*50)
+logger.info(f"Script location: {os.path.abspath(__file__)}")
+logger.info(f"Working directory: {os.getcwd()}")
+logger.info(f"PAPERLESS_URL: {os.getenv('PAPERLESS_URL', 'not set')}")
+logger.info(f"PAPERLESS_TOKEN: {'set' if os.getenv('PAPERLESS_TOKEN') else 'not set'}")
 
-    def get_document_by_id(self, document_id):
-        self.logger.debug(f"Fetching document {document_id}")
+class PaperlessAPI:
+    def __init__(self):
+        self.base_url = os.getenv('PAPERLESS_URL', 'http://localhost:8000')
+        self.token = os.getenv('PAPERLESS_TOKEN')
+        if not self.token:
+            raise ValueError("PAPERLESS_TOKEN environment variable is required")
+        
+        self.headers = {
+            'Authorization': f'Token {self.token}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Test connection on initialization
+        self.test_connection()
+    
+    def test_connection(self):
+        """Test API connection and authentication"""
         try:
+            logger.info("Testing API connection...")
             response = requests.get(
-                f"{self._api_url}/documents/{document_id}/",
-                headers={"Authorization": f"Token {self._auth_token}"}
+                f'{self.base_url}/api/documents/',
+                headers=self.headers,
+                params={'page_size': 1}  # Only request one document to minimize data transfer
             )
-            self.logger.debug(f"API Response: {response.status_code}")
             
-            if not response.ok:
-                self.logger.error(f"Failed to fetch document {document_id}: {response.status_code}")
-                return {'tags': []}  # Return minimal valid document data
-            
-            try:
-                return response.json()
-            except ValueError:
-                self.logger.error(f"Invalid JSON in response: {response.text[:100]}")
-                return {'tags': []}  # Return minimal valid document data
-            
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"Request failed: {str(e)}")
-            return {'tags': []}  # Return minimal valid document data
-
-    def get_or_create_correspondent(self, name):
-        # First try to find existing correspondent
-        response = requests.get(
-            f"{self._api_url}/correspondents/",
-            headers={"Authorization": f"Token {self._auth_token}"},
-            params={"name": name}
-        )
-        if response.ok and response.json()['results']:
-            correspondent_id = response.json()['results'][0]['id']
-            self.logger.info(f"Found existing correspondent '{name}' (ID: {correspondent_id})")
-            return correspondent_id
-        
-        # Create new correspondent if not found
-        self.logger.info(f"Creating new correspondent: {name}")
-        response = requests.post(
-            f"{self._api_url}/correspondents/",
-            headers={"Authorization": f"Token {self._auth_token}"},
-            json={"name": name}
-        )
-        if response.ok:
-            correspondent_id = response.json()['id']
-            self.logger.info(f"Created new correspondent '{name}' (ID: {correspondent_id})")
-            return correspondent_id
-        self.logger.error(f"Failed to create correspondent '{name}': {response.status_code}")
-        return None
-
-    def get_or_create_tag(self, name):
-        # First try to find existing tag
-        response = requests.get(
-            f"{self._api_url}/tags/",
-            headers={"Authorization": f"Token {self._auth_token}"},
-            params={"name": name}
-        )
-        if response.ok and response.json()['results']:
-            return response.json()['results'][0]['id']
-        
-        # Create new tag if not found
-        response = requests.post(
-            f"{self._api_url}/tags/",
-            headers={"Authorization": f"Token {self._auth_token}"},
-            json={"name": name}
-        )
-        return response.json()['id'] if response.ok else None
-
-    def update_document(self, document_id, updates):
-        self.logger.debug(f"Sending update request for document {document_id}")
-        self.logger.debug(f"Update data: {updates}")
-        try:
-            response = requests.patch(
-                f"{self._api_url}/documents/{document_id}/",
-                headers={"Authorization": f"Token {self._auth_token}"},
-                json=updates
-            )
-            self.logger.debug(f"Update response status: {response.status_code}")
-            if not response.ok:
-                self.logger.error(f"Update failed: {response.status_code}")
-                self.logger.error(f"Response content: {response.text}")
-            return response.ok
+            if response.status_code == 200:
+                data = response.json()
+                doc_count = data.get('count', 0)
+                logger.info(f"API connection successful! Found {doc_count} documents in system.")
+                return True
+            elif response.status_code == 401:
+                logger.error("API authentication failed. Check your PAPERLESS_TOKEN.")
+                raise ValueError("Invalid API token")
+            else:
+                logger.error(f"API connection failed with status {response.status_code}")
+                logger.error(f"Response: {response.text}")
+                raise ConnectionError(f"API connection failed: {response.status_code}")
+                
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Could not connect to {self.base_url}")
+            logger.error(f"Connection error: {str(e)}")
+            raise
         except Exception as e:
-            self.logger.error(f"Update request failed: {str(e)}")
-            return False
+            logger.error(f"Unexpected error testing API connection: {str(e)}")
+            raise
+    
+    def get_or_create_correspondent(self, name):
+        """Get existing correspondent or create new one"""
+        # First try to find existing
+        response = requests.get(
+            f'{self.base_url}/api/correspondents/?name={name}',
+            headers=self.headers
+        )
+        results = response.json().get('results', [])
+        
+        if results:
+            return results[0]['id']
+            
+        # Create new correspondent
+        response = requests.post(
+            f'{self.base_url}/api/correspondents/',
+            headers=self.headers,
+            json={'name': name}
+        )
+        return response.json()['id']
+    
+    def get_or_create_tags(self, keywords):
+        """Convert PDF keywords to Paperless tags"""
+        tag_ids = []
+        for keyword in keywords.split(','):
+            keyword = keyword.strip()
+            if not keyword:
+                continue
+                
+            # Try to find existing tag
+            response = requests.get(
+                f'{self.base_url}/api/tags/?name={keyword}',
+                headers=self.headers
+            )
+            results = response.json().get('results', [])
+            
+            if results:
+                tag_ids.append(results[0]['id'])
+            else:
+                # Create new tag
+                response = requests.post(
+                    f'{self.base_url}/api/tags/',
+                    headers=self.headers,
+                    json={'name': keyword}
+                )
+                tag_ids.append(response.json()['id'])
+        
+        return tag_ids
+
+    def update_document(self, doc_id, metadata):
+        """Update document with extracted metadata"""
+        response = requests.patch(
+            f'{self.base_url}/api/documents/{doc_id}/',
+            headers=self.headers,
+            json=metadata
+        )
+        return response.json()
 
 def extract_pdf_metadata(pdf_path):
-    logger.info(f"Extracting metadata from: {pdf_path}")
+    """Extract metadata from PDF file"""
+    logger.info(f"Attempting to extract metadata from: {pdf_path}")
     try:
         reader = PdfReader(pdf_path)
-        metadata = reader.metadata
+        info = reader.metadata
         
-        if not metadata:
-            logger.warning(f"No metadata found in PDF: {pdf_path}")
-            return {}
-
-        logger.debug(f"Raw PDF metadata: {metadata}")
-        paperless_metadata = {}
+        # Log all available metadata for debugging
+        logger.info("Raw PDF metadata found:")
+        for key, value in info.items():
+            logger.info(f"  {key}: {value}")
         
-        # Author → Correspondent
-        if metadata.get('/Author'):
-            paperless_metadata['correspondent'] = metadata['/Author']
-            logger.info(f"Found Author: {metadata['/Author']}")
+        metadata = {}
+        if info.get('/Author'):
+            metadata['author'] = info['/Author']
+            logger.info(f"Found Author: {metadata['author']}")
         else:
-            logger.debug("No Author field found in PDF")
-        
-        # Title → Title (and fallback to Subject if Title is missing)
-        if metadata.get('/Title'):
-            paperless_metadata['title'] = metadata['/Title']
-            logger.info(f"Found Title: {metadata['/Title']}")
-        elif metadata.get('/Subject'):
-            paperless_metadata['title'] = metadata['/Subject']
-            logger.info(f"Using Subject as Title: {metadata['/Subject']}")
+            logger.info("No Author found in PDF metadata")
+            
+        if info.get('/Title'):
+            metadata['title'] = info['/Title']
+            logger.info(f"Found Title: {metadata['title']}")
+        elif info.get('/Subject'):  # Fallback to Subject if Title missing
+            metadata['title'] = info['/Subject']
+            logger.info(f"No Title found, using Subject: {metadata['title']}")
         else:
-            logger.debug("No Title or Subject found in PDF")
-        
-        # CreationDate → Created Date
-        if metadata.get('/CreationDate'):
-            date_str = metadata['/CreationDate']
-            logger.debug(f"Found Creation Date: {date_str}")
-            # Remove D: prefix and timezone if present
-            date_str = date_str.replace('D:', '')[:14]  # Get YYYYMMDDHHMMSS
+            logger.info("No Title or Subject found in PDF metadata")
+            
+        if info.get('/Keywords'):
+            metadata['keywords'] = info['/Keywords']
+            logger.info(f"Found Keywords: {metadata['keywords']}")
+        else:
+            logger.info("No Keywords found in PDF metadata")
+            
+        if info.get('/CreationDate'):
+            # Convert PDF date format (D:YYYYMMDDhhmmss) to ISO
+            date_str = info['/CreationDate'][2:]  # Remove 'D:' prefix
             try:
                 date = datetime.strptime(date_str, '%Y%m%d%H%M%S')
-                paperless_metadata['created'] = date.isoformat()
-                logger.info(f"Parsed Creation Date: {paperless_metadata['created']}")
+                metadata['created'] = date.isoformat()
+                logger.info(f"Found Creation Date: {metadata['created']}")
             except ValueError as e:
-                logger.error(f"Could not parse date {date_str}: {e}")
+                logger.warning(f"Could not parse PDF creation date: {date_str}")
+                logger.warning(f"Parse error: {e}")
         else:
-            logger.debug("No Creation Date found in PDF")
+            logger.info("No Creation Date found in PDF metadata")
         
-        # Keywords → Tags (if present)
-        if metadata.get('/Keywords'):
-            tags = [tag.strip() for tag in metadata['/Keywords'].split(',')]
-            paperless_metadata['tags'] = tags
-            logger.info(f"Found Keywords/Tags: {tags}")
-        else:
-            logger.debug("No Keywords found in PDF")
-        
-        logger.info(f"Extracted metadata: {paperless_metadata}")
-        return paperless_metadata
-        
+        return metadata
     except Exception as e:
-        logger.error(f"Error extracting PDF metadata: {str(e)}", exc_info=True)
-        return {}
+        logger.error(f"Error extracting PDF metadata: {e}")
+        return None
+
+def process_document(doc_id, pdf_path):
+    """Main processing function"""
+    logger.info("="*30)
+    logger.info(f"Processing document {doc_id}: {pdf_path}")
+    logger.info("="*30)
+    
+    metadata = extract_pdf_metadata(pdf_path)
+    if not metadata:
+        logger.warning(f"No metadata found in {pdf_path}")
+        return
+    
+    logger.info("Extracted metadata summary:")
+    for key, value in metadata.items():
+        logger.info(f"  {key}: {value}")
+    
+    try:
+        api = PaperlessAPI()  # This will test connection
+        update_data = {}
+        
+        # Handle correspondent (author)
+        if metadata.get('author'):
+            correspondent_id = api.get_or_create_correspondent(metadata['author'])
+            update_data['correspondent'] = correspondent_id
+            logger.info(f"Set correspondent ID: {correspondent_id} for author: {metadata['author']}")
+        
+        # Handle title
+        if metadata.get('title'):
+            update_data['title'] = metadata['title']
+            logger.info(f"Set title: {metadata['title']}")
+        
+        # Handle creation date
+        if metadata.get('created'):
+            update_data['created'] = metadata['created']
+            logger.info(f"Set creation date: {metadata['created']}")
+        
+        # Handle keywords/tags
+        if metadata.get('keywords'):
+            tag_ids = api.get_or_create_tags(metadata['keywords'])
+            if tag_ids:
+                update_data['tags'] = tag_ids
+                logger.info(f"Set tag IDs: {tag_ids} for keywords: {metadata['keywords']}")
+        
+        # Update document
+        if update_data:
+            logger.info(f"Updating document {doc_id} with data: {update_data}")
+            api.update_document(doc_id, update_data)
+            logger.info(f"Successfully updated document {doc_id}")
+        else:
+            logger.info(f"No metadata updates needed for document {doc_id}")
+            
+    except Exception as e:
+        logger.error(f"Failed to process document {doc_id}: {e}")
+        raise
 
 if __name__ == "__main__":
+    import sys
+    logger.info(f"Script called with {len(sys.argv)} arguments:")
+    for i, arg in enumerate(sys.argv):
+        logger.info(f"Argument {i}: {arg}")
+    
     try:
-        document_id = os.environ["DOCUMENT_ID"]
-        document_source = os.environ["DOCUMENT_SOURCE_PATH"]
+        if len(sys.argv) != 3:
+            logger.error("Incorrect number of arguments")
+            logger.error("Usage: pdf_metadata_sync.py <document_id> <pdf_path>")
+            sys.exit(1)
         
-        # Get these from environment or use defaults
-        api_url = os.environ.get("PAPERLESS_URL", "http://localhost:8000/api")
-        auth_token = os.environ.get("PAPERLESS_TOKEN")
-
-        if not auth_token:
-            logger.error("No PAPERLESS_TOKEN found in environment")
-            exit(1)
-
-        api = SimplePaperlessAPI(api_url, auth_token)
-
-        # Only process PDFs
-        if document_source.lower().endswith('.pdf'):
-            logger.info(f"Processing PDF: {document_source}")
-            
-            # Get PDF metadata
-            metadata = extract_pdf_metadata(document_source)
-            
-            if metadata:
-                logger.info(f"Extracted metadata: {metadata}")
-                
-                # Get current document data
-                logger.info(f"Fetching current document {document_id} from API...")
-                doc = api.get_document_by_id(document_id)
-                logger.debug(f"Current document data: {doc}")
-                
-                # Update fields with PDF metadata (always prefer PDF metadata)
-                updates = {}
-                
-                if metadata.get('correspondent'):
-                    logger.debug(f"Processing correspondent '{metadata['correspondent']}'")
-                    correspondent_id = api.get_or_create_correspondent(metadata['correspondent'])
-                    if correspondent_id:
-                        updates['correspondent'] = correspondent_id
-                        logger.info(f"Setting correspondent to: {metadata['correspondent']} (ID: {correspondent_id})")
-                    else:
-                        logger.warning(f"Failed to get/create correspondent: {metadata['correspondent']}")
-                
-                if metadata.get('title'):
-                    updates['title'] = metadata['title']
-                    logger.info(f"Setting title to: {metadata['title']}")
-                    
-                if metadata.get('created'):
-                    updates['created'] = metadata['created']
-                    logger.info(f"Setting created date to: {metadata['created']}")
-                    
-                if metadata.get('tags'):
-                    # Keep existing tags and add new ones from PDF
-                    existing_tags = set(t['id'] for t in doc.get('tags', []))
-                    logger.debug(f"Existing tag IDs: {existing_tags}")
-                    
-                    new_tag_ids = []
-                    for tag_name in metadata['tags']:
-                        tag_id = api.get_or_create_tag(tag_name)
-                        if tag_id:
-                            new_tag_ids.append(tag_id)
-                            logger.debug(f"Added tag: {tag_name} (ID: {tag_id})")
-                        else:
-                            logger.warning(f"Failed to get/create tag: {tag_name}")
-                    
-                    # Combine existing and new tags
-                    updates['tags'] = list(existing_tags | set(new_tag_ids))
-                    logger.info(f"Final tag list: {updates['tags']}")
-
-                if updates:
-                    logger.info(f"Preparing to update document {document_id}")
-                    logger.debug(f"Update payload: {updates}")
-                    if api.update_document(document_id, updates):
-                        logger.info("Update successful")
-                    else:
-                        logger.error("Failed to update document")
-                        logger.error("This might be due to invalid data in the updates payload")
-                else:
-                    logger.info("No updates needed")
-            else:
-                logger.info("No metadata found in PDF")
-        else:
-            logger.info(f"Skipping non-PDF file: {document_source}")
-
+        # Test API connection before processing
+        api = PaperlessAPI()  # This will test connection on init
+        
+        doc_id = sys.argv[1]
+        pdf_path = sys.argv[2]
+        logger.info(f"Processing document {doc_id} at path {pdf_path}")
+        process_document(doc_id, pdf_path)
+        
     except Exception as e:
-        logger.error(f"Error processing document: {str(e)}")
-        exit(1) 
+        logger.error(f"Fatal error: {str(e)}")
+        sys.exit(1) 
